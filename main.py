@@ -127,8 +127,9 @@ async def ai_group(group,idx):
  key=os.environ.get('AI_API_KEY'); model=os.environ.get('AI_MODEL'); base=os.environ.get('AI_BASE_URL','https://openrouter.ai/api/v1').rstrip('/')
  if not key or not model: fail('AI_API_KEY and AI_MODEL are required',503)
  # A bounded response budget helps avoid unexpectedly long generations.
- output_tokens=750 if len(group)==1 else 1600
+ output_tokens=1400 if len(group)==1 else 2800
  payload={'model':model,'temperature':0,'max_tokens':output_tokens,
+          'reasoning':{'enabled':False},
           'messages':[{'role':'system','content':SYSTEM_PROMPT},
                       {'role':'user','content':json.dumps({'dossiers':group},ensure_ascii=False,separators=(',',':'))}]}
  started=time.monotonic()
@@ -140,10 +141,16 @@ async def ai_group(group,idx):
    r.raise_for_status()
    obj=r.json()
    choice=obj['choices'][0]
-   print('AI_FINISH_REASON',idx,choice.get('finish_reason'),flush=True)
+   usage=obj.get('usage') or {}
+   details=usage.get('completion_tokens_details') or {}
+   print('AI_FINISH_REASON',idx,choice.get('finish_reason'),
+         'completion_tokens',usage.get('completion_tokens'),
+         'reasoning_tokens',details.get('reasoning_tokens'),flush=True)
+   if choice.get('finish_reason')=='length':
+    raise ValueError('Model exhausted output token budget before a complete answer')
    content=choice['message']['content']
    if isinstance(content,list): content=''.join(x.get('text','') for x in content if isinstance(x,dict))
-   if not isinstance(content,str): raise ValueError('Empty/non-text model response')
+   if not isinstance(content,str) or not content.strip(): raise ValueError('Empty/non-text model response')
    content=content.strip(); content=re.sub(r'^```(?:json)?\s*|\s*```$','',content)
    result=json.loads(content)
    decisions=result.get('decisions')
