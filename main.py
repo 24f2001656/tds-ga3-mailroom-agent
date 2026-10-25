@@ -175,9 +175,9 @@ def persist_group(group, proposals):
     (digest(d),d['dossierId'],json.dumps(p)))
 
 async def ai_group(group,idx):
- key=os.environ.get('AI_API_KEY'); model=os.environ.get('AI_MODEL'); base=os.environ.get('AI_BASE_URL','https://openrouter.ai/api/v1').rstrip('/')
+ key=os.environ.get('AI_API_KEY'); model=os.environ.get('AI_MODEL'); base=os.environ.get('AI_BASE_URL','https://api.groq.com/openai/v1').rstrip('/')
  if not key or not model: fail('AI_API_KEY and AI_MODEL are required',503)
- output_tokens=1400 if len(group)==1 else 2800
+ output_tokens=1800 if len(group)==1 else min(4500, 1100*len(group)+300)
  started=time.monotonic()
  last_problem='unavailable'
  # Retry once only for model formatting/validation errors; never fabricate a decision.
@@ -199,8 +199,9 @@ async def ai_group(group,idx):
   if attempt==2:
    messages.append({'role':'system','content':format_reminder})
   messages.append({'role':'user','content':json.dumps({'dossiers':group},ensure_ascii=False,separators=(',',':'))})
-  payload={'model':model,'temperature':0,'max_tokens':output_tokens,
-           'reasoning':{'enabled':False},'messages':messages}
+  payload={'model':model,'temperature':0,'max_completion_tokens':output_tokens,
+           'reasoning_effort':'low','include_reasoning':False,
+           'response_format':{'type':'json_object'},'messages':messages}
   print('AI_GROUP_START',idx,'attempt',attempt,'dossiers',len(group),'max_tokens',output_tokens,flush=True)
   try:
    timeout=httpx.Timeout(connect=5,read=min(30,max(8,remaining-3)),write=10,pool=5)
@@ -239,7 +240,9 @@ async def ai_group(group,idx):
    raise
   except httpx.HTTPStatusError as e:
    status=e.response.status_code
-   print('AI_GROUP_ERROR',idx,'attempt',attempt,'HTTPStatusError','status',status,flush=True)
+   print('AI_GROUP_ERROR',idx,'attempt',attempt,'HTTPStatusError','status',status,
+         'retry_after',e.response.headers.get('retry-after'),
+         'remaining_tokens',e.response.headers.get('x-ratelimit-remaining-tokens'),flush=True)
    if status in (429,503) and attempt==1:
     try: delay=float(e.response.headers.get('Retry-After','1.5'))
     except ValueError: delay=1.5
@@ -261,9 +264,9 @@ async def ai_group(group,idx):
 
 async def decide_missing(missing):
  # Smaller groups reduce output truncation and make slow providers easier to diagnose.
- group_size=max(1,min(4,int(os.environ.get('AI_GROUP_SIZE','2'))))
+ group_size=max(1,min(4,int(os.environ.get('AI_GROUP_SIZE','4'))))
  groups=[missing[i:i+group_size] for i in range(0,len(missing),group_size)]
- semaphore=asyncio.Semaphore(max(1,min(8,int(os.environ.get('AI_CONCURRENCY','4')))))
+ semaphore=asyncio.Semaphore(max(1,min(8,int(os.environ.get('AI_CONCURRENCY','2')))))
  async def run(i,g):
   async with semaphore: return await ai_group(g,i)
  started=time.monotonic()
