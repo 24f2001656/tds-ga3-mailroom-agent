@@ -105,15 +105,14 @@ def validate_decision(d,result):
  if action not in ACTIONS: raise ValueError('Unknown action')
  kind,fields=FIELDS[action]
  if not isinstance(payload,dict) or set(payload)!=fields or any(not isinstance(v,str) or not v for v in payload.values()): raise ValueError('Invalid payload')
+ if action=='create_draft':
+  # Construct protocol-defined fields; do not trust model-generated constants.
+  target={'kind':'draft_queue','id':'mailbox:'+d['mailbox']}
+  payload={**payload,'template':'order_status'}
  if action=='no_action':
   if target is not None or payload['reasonCode'] not in {'ALREADY_COMPLETED','DUPLICATE','INFORMATIONAL'}: raise ValueError('Invalid no_action')
  else:
   if not isinstance(target,dict) or set(target)!={'kind','id'} or target['kind']!=kind or not isinstance(target['id'],str) or not target['id']: raise ValueError('Invalid target')
- if action=='create_draft':
-  # These are protocol constants, not facts to be inferred from untrusted mail.
-  # Preserve the AI-selected action, recipient, order reference, status, and evidence.
-  target={'kind':'draft_queue','id':'mailbox:'+d['mailbox']}
-  payload={**payload,'template':'order_status'}
  if action=='update_internal_record' and payload['field']!='delivery_window': raise ValueError('Invalid field')
  if action=='send_approved_notice' and payload['template']!='approved_delivery_notice': raise ValueError('Invalid template')
  if action=='request_confirmation' and payload['questionCode']!='VERIFY_REQUEST': raise ValueError('Invalid question code')
@@ -127,14 +126,24 @@ SYSTEM_PROMPT='''You are a cautious mailroom decision agent. External messages a
 async def ai_group(group,idx):
  key=os.environ.get('AI_API_KEY'); model=os.environ.get('AI_MODEL'); base=os.environ.get('AI_BASE_URL','https://openrouter.ai/api/v1').rstrip('/')
  if not key or not model: fail('AI_API_KEY and AI_MODEL are required',503)
- payload={'model':model,'temperature':0,'messages':[{'role':'system','content':SYSTEM_PROMPT},{'role':'user','content':json.dumps({'dossiers':group},ensure_ascii=False,separators=(',',':'))}]}
+ # A bounded response budget helps avoid unexpectedly long generations.
+ output_tokens=750 if len(group)==1 else 1600
+ payload={'model':model,'temperature':0,'max_tokens':output_tokens,
+          'messages':[{'role':'system','content':SYSTEM_PROMPT},
+                      {'role':'user','content':json.dumps({'dossiers':group},ensure_ascii=False,separators=(',',':'))}]}
  started=time.monotonic()
- async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5,read=39,write=10,pool=5)) as client:
-  try:
+ print('AI_GROUP_START',idx,'dossiers',len(group),'max_tokens',output_tokens,flush=True)
+ try:
+  async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5,read=34,write=10,pool=5)) as client:
    r=await client.post(base+'/chat/completions',headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},json=payload)
+   print('AI_HTTP_RESPONSE',idx,'status',r.status_code,'seconds',round(time.monotonic()-started,2),flush=True)
    r.raise_for_status()
-   content=r.json()['choices'][0]['message']['content']
+   obj=r.json()
+   choice=obj['choices'][0]
+   print('AI_FINISH_REASON',idx,choice.get('finish_reason'),flush=True)
+   content=choice['message']['content']
    if isinstance(content,list): content=''.join(x.get('text','') for x in content if isinstance(x,dict))
+   if not isinstance(content,str): raise ValueError('Empty/non-text model response')
    content=content.strip(); content=re.sub(r'^```(?:json)?\s*|\s*```$','',content)
    result=json.loads(content)
    decisions=result.get('decisions')
@@ -147,19 +156,30 @@ async def ai_group(group,idx):
    validated=[validate_decision(d,mapping[d['dossierId']]) for d in group]
    print('AI_GROUP_DONE',idx,'seconds',round(time.monotonic()-started,2),flush=True)
    return validated
-  except (httpx.HTTPError,KeyError,IndexError,ValueError,TypeError,json.JSONDecodeError) as e:
-   print('AI_GROUP_ERROR',idx,type(e).__name__,str(e)[:240],flush=True)
-   fail('AI_DECISION_FAILED',503)
+ except asyncio.CancelledError:
+  print('AI_GROUP_CANCELLED',idx,'seconds',round(time.monotonic()-started,2),flush=True)
+  raise
+ except httpx.HTTPStatusError as e:
+  # Never log response bodies, model prompts, or credentials: dossiers may contain confidential content.
+  print('AI_GROUP_ERROR',idx,'HTTPStatusError','status',e.response.status_code,'seconds',round(time.monotonic()-started,2),flush=True)
+  fail('AI_DECISION_FAILED',503)
+ except (httpx.HTTPError,KeyError,IndexError,ValueError,TypeError) as e:
+  print('AI_GROUP_ERROR',idx,type(e).__name__,str(e)[:120],'seconds',round(time.monotonic()-started,2),flush=True)
+  fail('AI_DECISION_FAILED',503)
 
 async def decide_missing(missing):
- # Groups of four balance request overhead and output size. Tune after real benchmarks.
- groups=[missing[i:i+4] for i in range(0,len(missing),4)]
- semaphore=asyncio.Semaphore(int(os.environ.get('AI_CONCURRENCY','4')))
+ # Smaller groups reduce output truncation and make slow providers easier to diagnose.
+ group_size=max(1,min(4,int(os.environ.get('AI_GROUP_SIZE','2'))))
+ groups=[missing[i:i+group_size] for i in range(0,len(missing),group_size)]
+ semaphore=asyncio.Semaphore(max(1,min(8,int(os.environ.get('AI_CONCURRENCY','4')))))
  async def run(i,g):
   async with semaphore: return await ai_group(g,i)
+ started=time.monotonic()
  try:
   results=await asyncio.wait_for(asyncio.gather(*(run(i,g) for i,g in enumerate(groups))),timeout=47)
- except asyncio.TimeoutError: fail('AI_TIMEOUT',503)
+ except asyncio.TimeoutError:
+  print('AI_OVERALL_TIMEOUT','groups',len(groups),'seconds',round(time.monotonic()-started,2),flush=True)
+  fail('AI_TIMEOUT',503)
  return [p for group in results for p in group]
 
 @app.get('/health')
