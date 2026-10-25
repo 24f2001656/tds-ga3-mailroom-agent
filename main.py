@@ -110,7 +110,10 @@ def validate_decision(d,result):
  else:
   if not isinstance(target,dict) or set(target)!={'kind','id'} or target['kind']!=kind or not isinstance(target['id'],str) or not target['id']: raise ValueError('Invalid target')
  if action=='create_draft':
-  if target['id']!='mailbox:'+d['mailbox'] or payload['template']!='order_status': raise ValueError('Draft mismatch')
+  # These are protocol constants, not facts to be inferred from untrusted mail.
+  # Preserve the AI-selected action, recipient, order reference, status, and evidence.
+  target={'kind':'draft_queue','id':'mailbox:'+d['mailbox']}
+  payload={**payload,'template':'order_status'}
  if action=='update_internal_record' and payload['field']!='delivery_window': raise ValueError('Invalid field')
  if action=='send_approved_notice' and payload['template']!='approved_delivery_notice': raise ValueError('Invalid template')
  if action=='request_confirmation' and payload['questionCode']!='VERIFY_REQUEST': raise ValueError('Invalid question code')
